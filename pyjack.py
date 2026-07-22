@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
+import json
 import sys
+import ssl
 import argparse
 import socket
 import threading
-from urllib.request import urlopen
+from dataclasses import dataclass
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
-HTTP_HEAD = {
-    "Content-Type": "text/html; charset=utf-8",
-    "X-Custom-Header": "Clickjack-Test"}
+HTTPS_CONTEXT = ssl.create_default_context()
 
+HTTP_HEAD = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; "
+        "rv:142.0) Gecko/20100101 Firefox/142.0"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "identity",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "close",
+}
 
 # Helper Functions
 # ----------------------------
 
 def help():
     print("PyJack - HTTP Clickjack Tester")
-
-def is_vulnerable(url):
-    try:
-        http_head = urlopen(url).info()
-        if not "X-Frame-Options" in http_head: return True
-    except: return False
 
 def get_free_tcp_port():
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -31,51 +42,104 @@ def get_free_tcp_port():
     tcp.close()
     return port
 
-def mk_recv(url) -> str:
-    return """
-    <!doctype html>
-    <html>
-    <head>
-        <title>PyJack - Clickjack Tester</title>
-        <style>
-            body {{background:#640fd3;color: #eeeeee;display: block;}}
-            h1,p {{margin-top: 20px;margin-left: 40px;line-height:0.5em;}}
-            iframe {{width:1080px;height:720px;margin:auto;display:block;}}
-        </style>
-        <script>
-            src="{0}"
-            function setWindowOrigin()
-            {{
-                document.getElementById("window-origin").innerHTML=window.origin;
-                console.log(window.origin)
-            }}
-            function setIFrameSrc()
-            {{
-                document.getElementById('iframe-src').innerHTML=src;
-                document.getElementById('iframe').src=src;
-                console.log(src)
-            }}
-            function main() 
-            {{
-                setWindowOrigin();
-                setIFrameSrc();
+def mk_request(url: str) -> Request:
+    return Request(
+        url,
+        headers=HTTP_HEAD
+    )
 
-            }}
-        </script>
-    </head>
+
+
+# Clickjack Request
+# ----------------------------
+
+
+@dataclass
+class ClickjackRequest:
+    target: str
+
+    def get_headers(self):
+        try:
+            response = urlopen(
+                mk_request(self.target),
+                context=HTTPS_CONTEXT,
+                timeout=10
+            )
+
+            return response.info()
+
+        except HTTPError as exc:
+            print(f"[!] Target returned HTTP {exc.code}")
+            return exc.headers
+
+        except (URLError, TimeoutError, OSError) as exc:
+            print(f"[x] Request failed: {exc}")
+            return None
+
+    def has_xfo(self) -> bool:
+        headers = self.get_headers()
+        return headers is not None and "X-Frame-Options" in headers
+
+    def is_vulnerable(self) -> bool:
+        if self.has_xfo():
+            return False
+
+        return True
+
+    def mk_recv(self) -> str:
+        return """
+        <!doctype html>
+        <html>
+        <head>
+            <title>PyJack - Clickjack Tester</title>
+            <style>
+                body {{background:#640fd3;color:#eeeeee;display:block;}}
+                h1,p {{margin-top:20px;margin-left:40px;line-height:0.5em;}}
+                iframe {{width:1080px;height:720px;margin:auto;display:block;}}
+            </style>
+            <script>
+                src={0}
+
+                function setWindowOrigin()
+                {{
+                    document.getElementById("window-origin").innerHTML = window.origin;
+                }}
+
+                function setIFrameSrc()
+                {{
+                    document.getElementById("iframe-src").innerHTML = src;
+                    document.getElementById("iframe").src = {0};
+                }}
+
+                function main()
+                {{
+                    setWindowOrigin();
+                    setIFrameSrc();
+                }}
+            </script>
+        </head>
         <body onload="main()">
             <h1>Framable Response Check</h1>
-            <p>window.origin: <b id="window-origin"></b> -- IFrame Target: <b id="iframe-src"></b></p>
+            <p>
+                window.origin:
+                <b id="window-origin"></b>
+                --
+                IFrame Target:
+                <b id="iframe-src"></b>
+            </p>
             <iframe id="iframe" src=""></iframe>
         </body>
-    </html>
-    """.format(url)
+        </html>
+        """.format(json.dumps(self.target))
+
+
 
 
 # Optional PyQt5 WebCamera
 # ----------------------------
 
 def mk_webcamera():
+
     try:
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import Qt, QUrl, QTimer
@@ -83,7 +147,9 @@ def mk_webcamera():
     except ImportError:
         return None
 
+
     class WebCamera(QWebEngineView):
+
             def __init__(self, app: QApplication):
                 super().__init__()
                 self.app = app
@@ -93,11 +159,14 @@ def mk_webcamera():
                 self.setAttribute(Qt.WA_DontShowOnScreen)
                 self.page().settings().setAttribute(QWebEngineSettings.ShowScrollBars, False)
 
+
+
             def _take_screenshot(self):
                 if self.output_file:
                     print(f"saving file: {self.output_file}")
                     self.grab().save(self.output_file, b"PNG")
                 self.app.quit()
+
 
             def _on_load(self, ok: bool):
                 if not ok:
@@ -121,21 +190,25 @@ def mk_webcamera():
 
 
 
-def mk_srv(target: str):
+def mk_srv(packet: ClickjackRequest):
+
     class ClickjackHandler(BaseHTTPRequestHandler):
+
         def do_GET(self):
             try:
-                html = mk_recv(target).encode("utf-8")
+                html = packet.mk_recv().encode("utf-8")
+
                 self.send_response(200)
 
-                for header, value in HTTP_HEAD.items():
-                    self.send_header(header, value)
-                
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+
                 self.send_header("Content-Length", str(len(html)))
                 self.end_headers()
                 self.wfile.write(html)
-            except Exception as e:
-                print("unexpected error{}".format(e))
+
+            except Exception as exc:
+                print(f"unexpected error: {exc}")
+
     return ClickjackHandler
 
 def parse_args():
@@ -149,16 +222,25 @@ def parse_args():
     # Sanity checks
     if "http" not in args.target:
         print('[!] looks like your target is missing a schema!')
-        print('[?] did you mean: http://{}'.format(args.target))
-        sys.exit()
+        print('[?] did you mean http://{}'.format(args.target))
+        sys.exit(2)
+
+    parsed = urlparse(args.target)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        print("[x] Target must be a complete HTTP or HTTPS URL.")
+        print("[?] Example: https://example.com/")
+        sys.exit(2)
+
 
     return args
 
 def main():
+
     args = parse_args()
     target = args.target
     host,port = args.host, args.port
-    handler_cls = mk_srv(target)
+    clickjack = ClickjackRequest(args.target)
+    handler_cls = mk_srv(clickjack)
     httpd = HTTPServer((host, port), handler_cls)
     host_url = "http://{}:{}".format(host,port)
 
@@ -166,9 +248,11 @@ def main():
     print('\n----------------------------')
     print('[+] Checking if target is vulnerable...')
 
-    if is_vulnerable(target): print('[!] Target is vulnerable!')
+
+    if clickjack.is_vulnerable():
+        print("[!] Target is vulnerable!")
     else:
-        print('[x] Target is not vulnerable. Exiting.')
+        print("[x] Target is not vulnerable. Exiting.")
         sys.exit()
 
     # Start server in background so we can run Qt in main thread
@@ -217,7 +301,7 @@ def main():
         httpd.server_close()
 
 
-    
+
 
 if __name__ == "__main__":
     main()
